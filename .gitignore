@@ -1,0 +1,14 @@
+.vs/
+bin/
+obj/
+packages/
+*.user
+# Open and edit the .gitignore file to include:
+Debug/
+*.obj
+*.exe
+*.pdb
+*.idb
+*.tlog
+*.lastbuildstate
+*.vcxproj.filters
