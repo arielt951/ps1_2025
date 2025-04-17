@@ -1,4 +1,4 @@
-﻿// improved_channel.c
+﻿//channel.c
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +15,7 @@
 #define MAX_FRAME_SIZE 1600  // Enough room for header + payload
 
 #pragma pack(push, 1)
-typedef struct {
+typedef struct { //header struct
 	uint8_t src_mac[6];
 	uint8_t dst_mac[6];
 	uint16_t type;      // 0 = DATA, 2 = NOISE
