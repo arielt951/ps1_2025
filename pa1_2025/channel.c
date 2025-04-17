@@ -18,7 +18,7 @@
 typedef struct { //header struct
 	uint8_t src_mac[6];
 	uint8_t dst_mac[6];
-	uint16_t type;      // 0 = DATA, 2 = NOISE
+	uint16_t type;      // 0 = DATA, 1 = NOISE
 	uint32_t seq_num;
 	uint16_t length;
 } FrameHeader;
@@ -35,11 +35,59 @@ typedef struct {
 	bool active;
 } ClientInfo;
 
+// Function to initialize Winsock and create a listening socket
+SOCKET create_listening_socket(int port) {
+	// Initialize Winsock
+	WSADATA wsaData;
+	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (iResult != 0) {
+		fprintf(stderr, "Error at WSAStartup(): %d\n", iResult);
+		return INVALID_SOCKET;
+	}
+
+	// Create listening socket
+	SOCKET tcp_s = socket(AF_INET, SOCK_STREAM, 0);
+	if (tcp_s == INVALID_SOCKET) {
+		fprintf(stderr, "Error at socket(): %ld\n", WSAGetLastError());
+		WSACleanup();
+		return INVALID_SOCKET;
+	}
+
+	// Set socket to non-blocking mode
+	u_long mode = 1;
+	ioctlsocket(tcp_s, FIONBIO, &mode);
+
+	// Bind socket to port
+	struct sockaddr_in my_addr;
+	my_addr.sin_family = AF_INET;
+	my_addr.sin_addr.s_addr = INADDR_ANY;
+	my_addr.sin_port = htons(port);
+
+	int status = bind(tcp_s, (struct sockaddr*)&my_addr, sizeof(my_addr));
+	if (status == SOCKET_ERROR) {
+		fprintf(stderr, "bind() failed: %ld\n", WSAGetLastError());
+		closesocket(tcp_s);
+		WSACleanup();
+		return INVALID_SOCKET;
+	}
+
+	// Start listening
+	status = listen(tcp_s, MAX_CLIENTS);
+	if (status == SOCKET_ERROR) {
+		fprintf(stderr, "listen() failed: %ld\n", WSAGetLastError());
+		closesocket(tcp_s);
+		WSACleanup();
+		return INVALID_SOCKET;
+	}
+
+	return tcp_s;
+}
+
 // Function to create a noise frame
 void create_noise_frame(char* buffer) {
 	FrameHeader* noise = (FrameHeader*)buffer;
 	memset(noise, 0, sizeof(FrameHeader));
-	noise->type = 2; // NOISE
+	noise->type = 1; // NOISE (changed from 2 to 1 for consistency)
 }
 
 // Function to check for user input (Ctrl+Z)
@@ -94,50 +142,13 @@ int main(int argc, char *argv[]) {
 	int chan_port = atoi(argv[1]);
 	int slot_time_ms = atoi(argv[2]);
 
-	// Initialize Winsock
-	WSADATA wsaData;
-	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-	if (iResult != 0) {
-		fprintf(stderr, "Error at WSAStartup(): %d\n", iResult);
-		return 1;
-	}
-
-	// Create listening socket
-	SOCKET tcp_s = socket(AF_INET, SOCK_STREAM, 0);
+	// Create the listening socket
+	SOCKET tcp_s = create_listening_socket(chan_port);
 	if (tcp_s == INVALID_SOCKET) {
-		fprintf(stderr, "Error at socket(): %ld\n", WSAGetLastError());
-		WSACleanup();
 		return 1;
 	}
 
-	// Set socket to non-blocking mode
-	u_long mode = 1;
-	ioctlsocket(tcp_s, FIONBIO, &mode);
-
-	// Bind socket to port
-	struct sockaddr_in my_addr;
-	my_addr.sin_family = AF_INET;
-	my_addr.sin_addr.s_addr = INADDR_ANY;
-	my_addr.sin_port = htons(chan_port);
-
-	int status = bind(tcp_s, (struct sockaddr*)&my_addr, sizeof(my_addr));
-	if (status == SOCKET_ERROR) {
-		fprintf(stderr, "bind() failed: %ld\n", WSAGetLastError());
-		closesocket(tcp_s);
-		WSACleanup();
-		return 1;
-	}
-
-	// Start listening
-	status = listen(tcp_s, MAX_CLIENTS);
-	if (status == SOCKET_ERROR) {
-		fprintf(stderr, "listen() failed: %ld\n", WSAGetLastError());
-		closesocket(tcp_s);
-		WSACleanup();
-		return 1;
-	}
-
-	printf("Channel listening on port %d\n", chan_port);
+	printf("Channel listening on port %d with slot time %d ms\n", chan_port, slot_time_ms);
 
 	// Setup client tracking
 	ClientInfo clients[MAX_CLIENTS];
@@ -256,6 +267,15 @@ int main(int argc, char *argv[]) {
 					}
 					clients[i].last_frame_time = clock();
 					clients[i].total_bytes += bytes;
+
+					// Print received message information
+					FrameHeader* header = (FrameHeader*)frame_buffers[frames_received - 1];
+					printf("Received frame from %s:%d - Type: %d, Seq: %u, Length: %d bytes\n",
+						inet_ntoa(clients[i].addr.sin_addr),
+						ntohs(clients[i].addr.sin_port),
+						header->type,
+						header->seq_num,
+						bytes);
 				}
 				else if (bytes == 0 || (bytes == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK)) {
 					// Client disconnected or error
@@ -272,6 +292,12 @@ int main(int argc, char *argv[]) {
 		// Process received frames
 		if (frames_received == 1) {
 			// No collision - broadcast the frame to all clients
+			FrameHeader* header = (FrameHeader*)frame_buffers[0];
+			printf("Broadcasting frame - Type: %d, Seq: %u, Length: %d bytes\n",
+				header->type,
+				header->seq_num,
+				frame_lengths[0]);
+
 			for (int i = 0; i < client_count; i++) {
 				if (clients[i].active) {
 					int sent = send(clients[i].socket, frame_buffers[0], frame_lengths[0], 0);
@@ -283,11 +309,18 @@ int main(int argc, char *argv[]) {
 							clients[i].active = false;
 						}
 					}
+					else {
+						printf("Echoed DATA frame to %s:%d\n",
+							inet_ntoa(clients[i].addr.sin_addr),
+							ntohs(clients[i].addr.sin_port));
+					}
 				}
 			}
 		}
 		else if (frames_received > 1) {
 			// Collision - send noise and update collision counts
+			printf("Collision detected! %d frames received simultaneously\n", frames_received);
+
 			char noise_buffer[sizeof(FrameHeader)];
 			create_noise_frame(noise_buffer);
 
@@ -297,6 +330,11 @@ int main(int argc, char *argv[]) {
 					if (sent == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
 						closesocket(clients[i].socket);
 						clients[i].active = false;
+					}
+					else if (sent == sizeof(FrameHeader)) {
+						printf("Sent NOISE frame to %s:%d\n",
+							inet_ntoa(clients[i].addr.sin_addr),
+							ntohs(clients[i].addr.sin_port));
 					}
 				}
 			}
@@ -309,8 +347,9 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Print statistics after Ctrl+Z
+	fprintf(stderr, "\n=== Channel Statistics ===\n");
 	for (int i = 0; i < client_count; i++) {
-		if (clients[i].active) {
+		if (clients[i].total_frames > 0) {  // Changed from active to ensure we report all clients that sent frames
 			double bandwidth_mbps = 0.0;
 			if (clients[i].total_frames > 0 &&
 				clients[i].first_frame_time != 0 &&
@@ -328,7 +367,7 @@ int main(int argc, char *argv[]) {
 				clients[i].total_frames,
 				clients[i].collision_count);
 
-			fprintf(stderr, "Average bandwidth: %.3f Mbps\n", bandwidth_mbps);
+			fprintf(stderr, "Average bandwidth: %.3f Mbps\n\n", bandwidth_mbps);
 		}
 	}
 
