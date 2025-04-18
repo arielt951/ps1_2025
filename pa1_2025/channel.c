@@ -8,10 +8,13 @@
 #include <windows.h>
 #include <time.h>
 #include <stdbool.h>
+#include <conio.h>  // Added for _kbhit() and _getch() functions
 
 #pragma comment(lib, "Ws2_32.lib")
 
 #define MAX_FRAME_SIZE 1600  // Enough room for header + payload
+#define FRAME_TYPE_DATA 0
+#define FRAME_TYPE_NOISE 2
 
 #pragma pack(push, 1)
 typedef struct { //header struct
@@ -60,6 +63,8 @@ typedef struct ArchiveNode {
 static ClientNode* client_list = NULL;
 static int client_count = 0;
 static ArchiveNode* archive_list = NULL;
+static char global_noise_frame[sizeof(FrameHeader)];
+
 
 // Forward declarations
 void archive_server(ClientNode* client);
@@ -191,7 +196,7 @@ ClientNode* find_client_by_socket(SOCKET socket) {
 	return NULL;
 }
 
-//   function to archive before removing
+// Function to archive before removing
 void remove_client(SOCKET socket) {
 	ClientNode* current = client_list;
 	ClientNode* prev = NULL;
@@ -226,6 +231,7 @@ void remove_client(SOCKET socket) {
 		current = current->next;
 	}
 }
+
 // Cleanup all clients and free resources
 void cleanup_clients() {
 	ClientNode* current = client_list;
@@ -249,73 +255,121 @@ void cleanup_clients() {
 }
 
 // Create a noise frame to indicate collision
+FrameHeader* create_noise_frame() {
+	// Allocate memory for the noise frame
+	FrameHeader* noise_frame = (FrameHeader*)malloc(sizeof(FrameHeader));
+	if (!noise_frame) {
+		fprintf(stderr, "Failed to allocate memory for noise frame\n");
+		return NULL;
+	}
+
+	// Clear the frame first
+	memset(noise_frame, 0, sizeof(FrameHeader));
+
+	// Set fields
+	noise_frame->type = 2;  // NOISE type (explicit value)
+	noise_frame->seq_num = 0xFFFFFFFF;  // Special value
+	noise_frame->length = sizeof(FrameHeader);
+
+	printf("Created noise frame with Type: %d, Seq: %u, Length: %d\n",
+		noise_frame->type, noise_frame->seq_num, noise_frame->length);
+
+	return noise_frame;
+}
+/*
+// Create a noise frame to indicate collision
 void create_noise_frame(char* buffer) {
+	// First clear the entire buffer
+	memset(buffer, 0, sizeof(FrameHeader));
+
+	// Then set the frame header fields
 	FrameHeader* noise = (FrameHeader*)buffer;
-	memset(noise, 0, sizeof(FrameHeader));
-	noise->type = 2; // NOISE (keeping this as 2 for consistency with server)
+
+	// Set noise signal type (explicitly cast to ensure correct type)
+	noise->type = (uint16_t)FRAME_TYPE_NOISE;
+
+	// For clarity in debugging, set a special sequence number
+	noise->seq_num = 0xFFFFFFFF;
+
+	// Set length to header size only
+	noise->length = (uint16_t)sizeof(FrameHeader);
+
+	// Print debug info to verify the noise frame was created correctly
+	printf("Created noise frame with Type: %d, Seq: %u, Length: %d\n",
+		noise->type, noise->seq_num, noise->length);
+}*/
+
+// Enhanced broadcast function specifically for sending noise frames
+void broadcast_noise_frame(FrameHeader* noise_frame) {
+	ClientNode* current = client_list;
+	int successful_sends = 0;
+	int failed_sends = 0;
+
+	printf("Broadcasting NOISE frame (collision signal) to all clients:\n");
+
+	// Print the first few bytes of the noise frame for debugging
+	printf("Noise frame bytes: ");
+	unsigned char* bytes = (unsigned char*)noise_frame;
+	for (int i = 0; i < 8; i++) {
+		printf("%02X ", bytes[i]);
+	}
+	printf("...\n");
+
+	while (current != NULL) {
+		if (current->info.active) {
+			int sent = send(current->info.socket, (char*)noise_frame, sizeof(FrameHeader), 0);
+
+			if (sent == SOCKET_ERROR) {
+				int err = WSAGetLastError();
+				failed_sends++;
+
+				printf("  Failed to send to %s:%d - Error: %d\n",
+					inet_ntoa(current->info.addr.sin_addr),
+					ntohs(current->info.addr.sin_port),
+					err);
+
+				if (err != WSAEWOULDBLOCK) {
+					current->info.active = false;
+				}
+			}
+			else if (sent == sizeof(FrameHeader)) {
+				successful_sends++;
+				printf("  Sent noise frame to %s:%d\n",
+					inet_ntoa(current->info.addr.sin_addr),
+					ntohs(current->info.addr.sin_port));
+			}
+			else {
+				printf("  Partial send to %s:%d: %d of %d bytes\n",
+					inet_ntoa(current->info.addr.sin_addr),
+					ntohs(current->info.addr.sin_port),
+					sent, (int)sizeof(FrameHeader));
+			}
+		}
+		current = current->next;
+	}
+
+	printf("Noise frame broadcast complete: %d successful, %d failed\n",
+		successful_sends, failed_sends);
 }
 
+// Function to check for user input (Ctrl+Z)
 bool check_for_exit() {
-	// Check if user pressed Ctrl+Z or Ctrl+C
-	if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {   // Ctrl key is pressed
-		if ((GetAsyncKeyState('Z') & 0x8000) || (GetAsyncKeyState('C') & 0x8000)) {  // Z or C key is pressed
+	// Check if stdin has input
+	if (_kbhit()) {
+		int c = _getch();
+		// Check for Control+Z (ASCII 26) or Control+C (ASCII 3)
+		if (c == 26 || c == 3) {
 			printf("\nExit command detected (Ctrl+Z or Ctrl+C). Shutting down...\n");
 			return true;
 		}
 	}
-
-	// Alternative check for console input
-	HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-	DWORD numEvents = 0;
-
-	GetNumberOfConsoleInputEvents(hStdin, &numEvents);
-	if (numEvents > 0) {
-		INPUT_RECORD inRec[10];  // Read up to 10 events at once
-		DWORD numRead;
-
-		ReadConsoleInput(hStdin, inRec, 10, &numRead);
-		for (DWORD i = 0; i < numRead; i++) {
-			if (inRec[i].EventType == KEY_EVENT &&
-				inRec[i].Event.KeyEvent.bKeyDown) {
-				// Check for Ctrl+Z or Ctrl+C
-				if ((inRec[i].Event.KeyEvent.wVirtualKeyCode == 'Z' ||
-					inRec[i].Event.KeyEvent.wVirtualKeyCode == 'C') &&
-					(inRec[i].Event.KeyEvent.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))) {
-					printf("\nExit command detected (Ctrl+Z or Ctrl+C). Shutting down...\n");
-					return true;
-				}
-			}
-		}
-	}
-
 	return false;
 }
-/*
-// Function to check for user input (Ctrl+Z)
-bool check_for_exit() {
-	HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-	DWORD numEvents = 0;
-
-	GetNumberOfConsoleInputEvents(hStdin, &numEvents);
-	if (numEvents > 0) {
-		INPUT_RECORD inRec;
-		DWORD numRead;
-
-		PeekConsoleInput(hStdin, &inRec, 1, &numRead);
-		if (numRead > 0 && inRec.EventType == KEY_EVENT &&
-			inRec.Event.KeyEvent.bKeyDown &&
-			inRec.Event.KeyEvent.wVirtualKeyCode == 'Z' &&
-			(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
-			FlushConsoleInputBuffer(hStdin);
-			return true;
-		}
-	}
-	return false;
-}*/
 
 // Broadcast a message to all connected clients
 void broadcast_to_all(char* buffer, int length) {
 	ClientNode* current = client_list;
+	int successful_sends = 0;
 
 	while (current != NULL) {
 		if (current->info.active) {
@@ -327,9 +381,29 @@ void broadcast_to_all(char* buffer, int length) {
 					current->info.active = false;
 				}
 			}
+			else if (sent == length) {
+				successful_sends++;
+			}
 		}
 		current = current->next;
 	}
+
+	printf("Broadcast frame to %d active clients\n", successful_sends);
+}
+
+// Function to calculate average bandwidth in Mbps
+double calculate_bandwidth(int64_t bytes, clock_t start_time, clock_t end_time) {
+	if (start_time == 0 || end_time <= start_time) {
+		return 0.0;
+	}
+
+	double duration_sec = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+	if (duration_sec <= 0) {
+		return 0.0;
+	}
+
+	// Convert bytes to bits and divide by duration in seconds to get bps, then convert to Mbps
+	return (bytes * 8.0) / (duration_sec * 1000000);
 }
 
 // Function to print all archived statistics and current client statistics
@@ -340,15 +414,12 @@ void print_all_statistics() {
 	ClientNode* current = client_list;
 	while (current != NULL) {
 		if (current->info.total_frames > 0) {  // Report all clients that sent frames
-			double bandwidth_mbps = 0.0;
-			if (current->info.first_frame_time != 0 &&
-				current->info.last_frame_time > current->info.first_frame_time) {
-
-				double duration_sec = (double)(current->info.last_frame_time - current->info.first_frame_time) / CLOCKS_PER_SEC;
-				if (duration_sec > 0) {
-					bandwidth_mbps = (current->info.total_bytes * 8.0) / (duration_sec * 1000000); // Mbps
-				}
-			}
+			// Calculate bandwidth
+			double bandwidth_mbps = calculate_bandwidth(
+				current->info.total_bytes,
+				current->info.first_frame_time,
+				current->info.last_frame_time
+			);
 
 			fprintf(stderr, "From %s port %d: %d frames, %d collisions\n",
 				inet_ntoa(current->info.addr.sin_addr),
@@ -356,7 +427,7 @@ void print_all_statistics() {
 				current->info.total_frames,
 				current->info.collision_count);
 
-			fprintf(stderr, "Average bandwidth: %.3f Mbps\n\n", bandwidth_mbps);
+			fprintf(stderr, "Average bandwidth: %.3f Mbps\n", bandwidth_mbps);
 		}
 		current = current->next;
 	}
@@ -364,15 +435,12 @@ void print_all_statistics() {
 	// Then print statistics for all archived servers
 	ArchiveNode* archive = archive_list;
 	while (archive != NULL) {
-		double bandwidth_mbps = 0.0;
-		if (archive->info.first_frame_time != 0 &&
-			archive->info.last_frame_time > archive->info.first_frame_time) {
-
-			double duration_sec = (double)(archive->info.last_frame_time - archive->info.first_frame_time) / CLOCKS_PER_SEC;
-			if (duration_sec > 0) {
-				bandwidth_mbps = (archive->info.total_bytes * 8.0) / (duration_sec * 1000000); // Mbps
-			}
-		}
+		// Calculate bandwidth
+		double bandwidth_mbps = calculate_bandwidth(
+			archive->info.total_bytes,
+			archive->info.first_frame_time,
+			archive->info.last_frame_time
+		);
 
 		fprintf(stderr, "From %s port %d: %d frames, %d collisions\n",
 			inet_ntoa(archive->info.addr.sin_addr),
@@ -380,7 +448,7 @@ void print_all_statistics() {
 			archive->info.total_frames,
 			archive->info.collision_count);
 
-		fprintf(stderr, "Average bandwidth: %.3f Mbps\n\n", bandwidth_mbps);
+		fprintf(stderr, "Average bandwidth: %.3f Mbps\n", bandwidth_mbps);
 
 		archive = archive->next;
 	}
@@ -417,6 +485,15 @@ int main(int argc, char *argv[]) {
 
 	printf("Channel listening on port %d with slot time %d ms\n", chan_port, slot_time_ms);
 
+	// Create the noise frame once at startup
+	FrameHeader* noise_frame = create_noise_frame();
+	if (!noise_frame) {
+		fprintf(stderr, "Failed to create noise frame, exiting\n");
+		closesocket(tcp_s);
+		WSACleanup();
+		return 1;
+	}
+
 	// Main channel loop
 	bool running = true;
 	while (running) {
@@ -446,6 +523,11 @@ int main(int argc, char *argv[]) {
 		timeout.tv_usec = slot_time_ms * 1000; // Convert ms to μs
 
 		int ready_count = select(0, &readfds, NULL, NULL, &timeout);
+		if (ready_count == SOCKET_ERROR) {
+			fprintf(stderr, "select() failed: %d\n", WSAGetLastError());
+			Sleep(100); // Avoid busy waiting in case of persistent error
+			continue;
+		}
 
 		// Check for accept on listening socket
 		if (FD_ISSET(tcp_s, &readfds)) {
@@ -474,10 +556,19 @@ int main(int argc, char *argv[]) {
 			ClientNode* sender;
 		} ReceivedFrame;
 
-		ReceivedFrame* received_frames = (ReceivedFrame*)malloc(client_count * sizeof(ReceivedFrame));
-		if (!received_frames) {
-			fprintf(stderr, "Memory allocation failed for received frames\n");
-			continue;
+		// Allocate array for received frames
+		ReceivedFrame* received_frames = NULL;
+		if (client_count > 0) {
+			received_frames = (ReceivedFrame*)malloc(client_count * sizeof(ReceivedFrame));
+			if (!received_frames) {
+				fprintf(stderr, "Memory allocation failed for received frames\n");
+				continue;
+			}
+
+			// Initialize buffer pointers to NULL for safe cleanup
+			for (int i = 0; i < client_count; i++) {
+				received_frames[i].buffer = NULL;
+			}
 		}
 
 		int frames_received = 0;
@@ -494,11 +585,17 @@ int main(int argc, char *argv[]) {
 					current->frame_length = bytes;
 
 					// Store frame for later processing
-					if (frames_received < client_count) {
-						received_frames[frames_received].buffer = current->frame_buffer;
-						received_frames[frames_received].length = bytes;
-						received_frames[frames_received].sender = current;
-						frames_received++;
+					if (received_frames && frames_received < client_count) {
+						received_frames[frames_received].buffer = malloc(bytes);
+						if (received_frames[frames_received].buffer) {
+							memcpy(received_frames[frames_received].buffer, current->frame_buffer, bytes);
+							received_frames[frames_received].length = bytes;
+							received_frames[frames_received].sender = current;
+							frames_received++;
+						}
+						else {
+							fprintf(stderr, "Failed to allocate memory for frame data\n");
+						}
 					}
 
 					// Update statistics
@@ -523,7 +620,7 @@ int main(int argc, char *argv[]) {
 					printf("Client disconnected: %s:%d\n",
 						inet_ntoa(current->info.addr.sin_addr),
 						ntohs(current->info.addr.sin_port));
-					// Remove call to print_statistics() - we only want to print at exit
+
 					current->info.active = false;
 					remove_client(current->info.socket);
 				}
@@ -544,21 +641,33 @@ int main(int argc, char *argv[]) {
 			broadcast_to_all(received_frames[0].buffer, received_frames[0].length);
 		}
 		else if (frames_received > 1) {
-			// Collision - send noise and update collision counts
-			printf("Collision detected! %d frames received simultaneously\n", frames_received);
+			// Collision detected
+			printf("COLLISION DETECTED: %d frames received simultaneously\n", frames_received);
 
-			char noise_buffer[sizeof(FrameHeader)];
-			create_noise_frame(noise_buffer);
-			broadcast_to_all(noise_buffer, sizeof(FrameHeader));
+			// Use the specialized function to broadcast the noise frame
+			broadcast_noise_frame(noise_frame);
 
 			// Update collision statistics
 			for (int k = 0; k < frames_received; k++) {
-				received_frames[k].sender->info.collision_count++;
+				if (received_frames[k].sender) {
+					received_frames[k].sender->info.collision_count++;
+					printf("Incremented collision count for %s:%d to %d\n",
+						inet_ntoa(received_frames[k].sender->info.addr.sin_addr),
+						ntohs(received_frames[k].sender->info.addr.sin_port),
+						received_frames[k].sender->info.collision_count);
+				}
 			}
 		}
 
-		// Free the received frames array
-		free(received_frames);
+		// Free the received frames
+		if (received_frames) {
+			for (int i = 0; i < frames_received; i++) {
+				if (received_frames[i].buffer) {
+					free(received_frames[i].buffer);
+				}
+			}
+			free(received_frames);
+		}
 	}
 
 	// Print statistics after Ctrl+Z
@@ -569,6 +678,7 @@ int main(int argc, char *argv[]) {
 
 	// Clean up and free resources
 	cleanup_clients();
+	free(noise_frame);  // Free the noise frame
 	closesocket(tcp_s);
 	WSACleanup();
 

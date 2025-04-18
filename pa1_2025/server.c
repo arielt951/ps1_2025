@@ -9,6 +9,9 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 #define MAX_ATTEMPTS 10
+#define FRAME_TYPE_DATA 0
+#define FRAME_TYPE_NOISE 2
+#define MAX_FRAME_SIZE 1600 // Maximum safe frame size
 
 #pragma pack(push, 1)
 typedef struct {
@@ -21,18 +24,50 @@ typedef struct {
 //20bytes header size
 #pragma pack(pop)
 
+// Function to flush all pending data from a socket
+void flush_socket(SOCKET s) {
+	u_long avail = 0;
+
+	// Check how many bytes are available to read
+	if (ioctlsocket(s, FIONREAD, &avail) != 0) {
+		fprintf(stderr, "Error checking socket buffer: %d\n", WSAGetLastError());
+		return;
+	}
+
+	if (avail > 0) {
+		fprintf(stderr, "Flushing %lu bytes from socket\n", avail);
+
+		char temp_buf[1024];
+		while (avail > 0) {
+			int to_read = (avail > sizeof(temp_buf)) ? sizeof(temp_buf) : avail;
+			int read = recv(s, temp_buf, to_read, 0);
+
+			if (read <= 0) {
+				if (read < 0) {
+					fprintf(stderr, "Error during socket flush: %d\n", WSAGetLastError());
+				}
+				break;
+			}
+
+			avail -= read;
+		}
+
+		fprintf(stderr, "Socket flushed successfully\n");
+	}
+}
+
 //function to open and connect to socket
-SOCKET connect_to_channel(const char *chan_ip, int chan_port) { 
+SOCKET connect_to_channel(const char *chan_ip, int chan_port) {
 	WSADATA wsaData; //start 
 	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
 	if (iResult != 0) {
-		printf("Error at WSAStartup()\n");
+		fprintf(stderr, "Error at WSAStartup()\n");
 		return INVALID_SOCKET;
 	}
 
 	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); //create socket
 	if (s == INVALID_SOCKET) {
-		printf("Error at socket(): %ld\n", WSAGetLastError());
+		fprintf(stderr, "Error at socket(): %ld\n", WSAGetLastError());
 		WSACleanup();
 		return INVALID_SOCKET;
 	}
@@ -52,12 +87,30 @@ SOCKET connect_to_channel(const char *chan_ip, int chan_port) {
 	return s;
 }
 
+// Function to verify if received frame header matches sent frame header
+int is_same_frame_header(FrameHeader* sent_header, FrameHeader* recv_header) {
+	// Debug print to see what headers we're comparing
+	fprintf(stderr, "Comparing headers - Sent: type=%d, seq=%u, len=%d vs Received: type=%d, seq=%u, len=%d\n",
+		sent_header->type, sent_header->seq_num, sent_header->length,
+		recv_header->type, recv_header->seq_num, recv_header->length);
+
+	// Check if all header fields match
+	if (recv_header->type != sent_header->type ||
+		recv_header->seq_num != sent_header->seq_num ||
+		recv_header->length != sent_header->length ||
+		memcmp(recv_header->src_mac, sent_header->src_mac, 6) != 0) {
+		return 0;  // Headers don't match
+	}
+
+	return 1;  // Headers match
+}
+
 int main(int argc, char *argv[]) {
 	if (argc != 8) {
 		fprintf(stderr, "Usage: %s <chan_ip> <chan_port> <file_name> <frame_size> <slot_time> <seed> <timeout>\n", argv[0]);
 		return 1;
 	}
-	//Parse agruments 
+	//Parse arguments 
 	const char *chan_ip = argv[1];
 	int chan_port = atoi(argv[2]);
 	const char *file_name = argv[3];
@@ -66,14 +119,26 @@ int main(int argc, char *argv[]) {
 	int seed = atoi(argv[6]);
 	int timeout_sec = atoi(argv[7]);
 
+	// Ensure frame size is valid
+	if (frame_size <= sizeof(FrameHeader)) {
+		fprintf(stderr, "Error: Frame size must be larger than header size (%d bytes)\n", (int)sizeof(FrameHeader));
+		return 1;
+	}
+
+	if (frame_size > MAX_FRAME_SIZE) {
+		fprintf(stderr, "Warning: Frame size %d exceeds maximum recommended size of %d bytes. Limiting.\n",
+			frame_size, MAX_FRAME_SIZE);
+		frame_size = MAX_FRAME_SIZE;
+	}
+
 	srand(seed);
-	
+
 	SOCKET s = connect_to_channel(chan_ip, chan_port);
 	if (s == INVALID_SOCKET) {
 		fprintf(stderr, "Error: Failed to connect to channel at %s:%d\n", chan_ip, chan_port);
 		return 1;
 	}
-	
+
 	FILE *fp = fopen(file_name, "rb"); //open the file 
 	if (!fp) {
 		perror("Error opening file");
@@ -91,104 +156,181 @@ int main(int argc, char *argv[]) {
 	const int payload_size = frame_size - header_size;
 	const int total_frames = (total_file_size + payload_size - 1) / payload_size;
 
+	fprintf(stderr, "Starting transmission of %s (%d bytes in %d frames)\n",
+		file_name, total_file_size, total_frames);
+	fprintf(stderr, "Frame size: %d bytes (header: %d bytes, payload: %d bytes)\n",
+		frame_size, header_size, payload_size);
+
 	uint8_t my_mac[6] = { 0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01 };
 	uint8_t channel_mac[6] = { 0xFF, 0xEE, 0xDD, 0x00, 0x00, 0x00 };
 
 	//allocating memory for each frame 
 	char *frame = malloc(frame_size);
-	char recv_buffer[1600];
+	if (!frame) {
+		fprintf(stderr, "Memory allocation failed\n");
+		fclose(fp);
+		closesocket(s);
+		WSACleanup();
+		return 1;
+	}
+
+	char recv_buffer[MAX_FRAME_SIZE];  // Buffer for receiving frames
 	int total_transmissions = 0;
 	int max_transmissions = 0;
 	int successful_frames = 0;
 
 	clock_t start_time = clock();
 
-	for (int i = 0; i < total_frames; ++i) { //frame ammout loop
-		int attempts = 0;
+	for (int frame_idx = 0; frame_idx < total_frames; ++frame_idx) {
+		int current_attempt = 0;
 		int success = 0;
 
-		//last frame may no be in the full size
+		// Calculate frame payload size (handle last frame)
 		int frame_payload_size = payload_size;
-		if (i == total_frames - 1) {
-			int remaining_bytes = total_file_size - (i * payload_size);
+		if (frame_idx == total_frames - 1) {
+			int remaining_bytes = total_file_size - (frame_idx * payload_size);
 			if (remaining_bytes < payload_size)
 				frame_payload_size = remaining_bytes;
 		}
 
-		//build headers for each frame
+		// Build header for this frame
 		FrameHeader header;
 		memcpy(header.src_mac, my_mac, 6);
 		memcpy(header.dst_mac, channel_mac, 6);
-		header.type = 0;
-		header.seq_num = i;
+		header.type = FRAME_TYPE_DATA;
+		header.seq_num = frame_idx;
 		header.length = frame_payload_size;
 
+		// Copy header into frame buffer
 		memcpy(frame, &header, header_size);
 
+		// Read the file data for this frame
+		fseek(fp, frame_idx * payload_size, SEEK_SET);
 		int bytes_read = fread(frame + header_size, 1, frame_payload_size, fp);
 		if (bytes_read != frame_payload_size) {
-			fprintf(stderr, "Error reading file at frame %d\n", i);
+			fprintf(stderr, "Error reading file at frame %d\n", frame_idx);
 			break;
 		}
 
-		
-		//send process 
-		while (attempts < MAX_ATTEMPTS) {
-			send(s, frame, header_size + frame_payload_size, 0);
-			++attempts;
-			++total_transmissions;
-			printf("Frame %d sent | Attempt %d | Total transmissions: %d\n", i, attempts, total_transmissions);
+		// Transmission loop for this frame - keep trying until success or MAX_ATTEMPTS
+		while (current_attempt < MAX_ATTEMPTS && !success) {
+			current_attempt++;
+			total_transmissions++;
 
-			//listening to the socket a after send
+			// Clear receive buffer before sending
+			memset(recv_buffer, 0, sizeof(recv_buffer));
+
+			// Flush socket to ensure clean state before sending
+			flush_socket(s);
+
+			// Send the frame
+			int bytes_sent = send(s, frame, header_size + frame_payload_size, 0);
+			if (bytes_sent != header_size + frame_payload_size) {
+				fprintf(stderr, "Error sending frame %d (attempt %d)\n", frame_idx, current_attempt);
+				continue;
+			}
+
+			fprintf(stderr, "Sent frame %d (attempt %d) - %d bytes\n",
+				frame_idx, current_attempt, header_size + frame_payload_size);
+
+			// Set up for listening with timeout
 			fd_set readfds;
 			FD_ZERO(&readfds);
 			FD_SET(s, &readfds);
 
-			//listening the timeout time
 			struct timeval timeout;
 			timeout.tv_sec = timeout_sec;
 			timeout.tv_usec = 0;
-			int ready = select(0, &readfds, NULL, NULL, &timeout);
 
-			if (ready > 0) { //data recieved 
-				int bytes = recv(s, recv_buffer, sizeof(recv_buffer), 0); 
-				if (bytes >= header_size) { //check if at least header was recieved
-					FrameHeader *response = (FrameHeader *)recv_buffer;
-					if (response->type == 2) {
-						printf("Received noise frame (collision detected)\n");
-						// continue to backoff and retry
+			// Wait for response with timeout
+			int select_result = select(s + 1, &readfds, NULL, NULL, &timeout);
+
+			if (select_result > 0) {
+				// Data available to read
+				int bytes_recv = recv(s, recv_buffer, sizeof(recv_buffer), 0);
+				fprintf(stderr, "Received %d bytes back\n", bytes_recv);
+
+				if (bytes_recv < header_size) {
+					fprintf(stderr, "Received truncated frame or noise signal\n");
+					// Flush socket and continue to backoff logic
+					flush_socket(s);
+				}
+				else {
+					FrameHeader* response = (FrameHeader*)recv_buffer;
+
+					if (response->type == FRAME_TYPE_NOISE) {
+						fprintf(stderr, "Collision detected (noise frame type=%d)\n", response->type);
+						// Flush socket to clear any buffered data after collision
+						flush_socket(s);
 					}
-					else if (memcmp(&header, response, header_size) == 0) {
+					else if (is_same_frame_header((FrameHeader*)frame, response)) {
+						// SUCCESS - Header matches between sent and received frame
 						success = 1;
 						successful_frames++;
-						printf("massage number %d echoed succesfully\n", i);
-						break; //if data recv matches the sent go to the next frame
+						fprintf(stderr, "Frame %d transmitted successfully\n", frame_idx);
+						break;  // Exit retry loop
+					}
+					else {
+						// Received a frame but the header doesn't match ours
+						fprintf(stderr, "Received mismatched frame, type=%d, seq=%u\n",
+							response->type, response->seq_num);
+						// Flush socket and continue to backoff logic
+						flush_socket(s);
 					}
 				}
 			}
-			printf("Entering backoff proc after frame #%d\n", i);
-			//exp backoff waiting time 
-			int backoff_range = 1 << attempts; //2^k
-			int n = rand() % backoff_range;
-			Sleep(n * slot_time_ms);
+			else if (select_result == 0) {
+				// Timeout occurred, treat as collision
+				fprintf(stderr, "Timeout waiting for frame %d (attempt %d)\n", frame_idx, current_attempt);
+				// No need to flush after timeout as nothing was received
+			}
+			else {
+				// Select error
+				fprintf(stderr, "Error in select(): %d\n", WSAGetLastError());
+				// Flush socket just to be sure
+				flush_socket(s);
+			}
 
+			// Only continue with backoff if we haven't succeeded
+			if (success) {
+				break;  // Skip backoff logic if successful
+			}
 
+			// Check for max attempts
+			if (current_attempt >= MAX_ATTEMPTS) {
+				fprintf(stderr, "Max attempts reached for frame %d\n", frame_idx);
+				break;
+			}
+
+			// Exponential backoff
+			int backoff_range = 1 << current_attempt;  // 2^k
+			int rand_slots = rand() % backoff_range;
+			int backoff_time = rand_slots * slot_time_ms;
+
+			fprintf(stderr, "Backoff: waiting %d ms before retrying frame %d\n",
+				backoff_time, frame_idx);
+			Sleep(backoff_time);
 		}
 
+		// Check if this frame failed after all attempts
 		if (!success) {
-			fprintf(stderr, "Frame %d failed after %d attempts\n", i, MAX_ATTEMPTS);
-			break;
+			fprintf(stderr, "Frame %d failed after %d attempts\n", frame_idx, MAX_ATTEMPTS);
+			break;  // Exit the main frame loop
 		}
 
-		if (attempts > max_transmissions)
-			max_transmissions = attempts;
+		// Update max transmissions stat
+		if (current_attempt > max_transmissions)
+			max_transmissions = current_attempt;
 	}
 
+	// Calculate statistics
 	clock_t end_time = clock();
-	int duration_ms = (int)((end_time - start_time) * 1000 / CLOCKS_PER_SEC);
-	double avg_transmissions = (double)total_transmissions / total_frames;
-	double avg_bandwidth_mbps = (8.0 * total_file_size) / (duration_ms * 1000.0);
+	int duration_ms = (int)((end_time - start_time) * 1000.0 / CLOCKS_PER_SEC);
+	double avg_transmissions = (double)total_transmissions / (successful_frames > 0 ? successful_frames : 1);
+	double avg_bandwidth_mbps = successful_frames > 0 ?
+		(8.0 * total_file_size) / (duration_ms / 1000.0) / 1000000.0 : 0;
 
+	// Print results to stderr as required
 	fprintf(stderr, "Sent file %s\n", file_name);
 	fprintf(stderr, "Result: %s\n", (successful_frames == total_frames) ? "Success :)" : "Failure :(");
 	fprintf(stderr, "File size: %d Bytes (%d frames)\n", total_file_size, total_frames);
@@ -196,6 +338,7 @@ int main(int argc, char *argv[]) {
 	fprintf(stderr, "Transmissions/frame: average %.2f, maximum %d\n", avg_transmissions, max_transmissions);
 	fprintf(stderr, "Average bandwidth: %.3f Mbps\n", avg_bandwidth_mbps);
 
+	// Clean up
 	free(frame);
 	fclose(fp);
 	closesocket(s);
