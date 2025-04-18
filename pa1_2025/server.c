@@ -18,6 +18,7 @@ typedef struct {
 	uint32_t seq_num;
 	uint16_t length;
 } FrameHeader;
+//20bytes header size
 #pragma pack(pop)
 
 //function to open and connect to socket
@@ -102,7 +103,7 @@ int main(int argc, char *argv[]) {
 
 	clock_t start_time = clock();
 
-	for (int i = 0; i < total_frames; ++i) {
+	for (int i = 0; i < total_frames; ++i) { //frame ammout loop
 		int attempts = 0;
 		int success = 0;
 
@@ -153,25 +154,30 @@ int main(int argc, char *argv[]) {
 				int bytes = recv(s, recv_buffer, sizeof(recv_buffer), 0); 
 				if (bytes >= header_size) { //check if at least header was recieved
 					FrameHeader *response = (FrameHeader *)recv_buffer;
-					if (memcmp(&header, response, header_size) == 0) {
+					if (response->type == 2) {
+						printf("Received noise frame (collision detected)\n");
+						// continue to backoff and retry
+					}
+					else if (memcmp(&header, response, header_size) == 0) {
 						success = 1;
 						successful_frames++;
+						printf("massage number %d echoed succesfully\n", i);
 						break; //if data recv matches the sent go to the next frame
-					}
-					else {
-						printf("Response does not match (collision or noise)\n");
 					}
 				}
 			}
-			printf("No responce after seding frame #%d\n", i);
+			printf("Entering backoff proc after frame #%d\n", i);
 			//exp backoff waiting time 
 			int backoff_range = 1 << attempts; //2^k
 			int n = rand() % backoff_range;
 			Sleep(n * slot_time_ms);
+
+
 		}
 
 		if (!success) {
 			fprintf(stderr, "Frame %d failed after %d attempts\n", i, MAX_ATTEMPTS);
+			break;
 		}
 
 		if (attempts > max_transmissions)
