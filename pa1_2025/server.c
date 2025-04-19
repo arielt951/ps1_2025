@@ -15,6 +15,7 @@
 #define FRAME_TYPE_NOISE 2
 #define CONNECTION_RETRY_MS 1000  // Time between connection retry attempts
 #define MAX_CTRL_Z_WAIT_SEC 60     // Maximum time to wait for Ctrl+Z input in seconds
+#define MIN_FRAME_SIZE 20        // Minimum frame size to accommodate header
 
 #pragma pack(push, 1)
 typedef struct {
@@ -116,12 +117,12 @@ void flush_socket(SOCKET s) {
 
 	// Check how many bytes are available to read
 	if (ioctlsocket(s, FIONREAD, &avail) != 0) {
-	//	fprintf(stderr, "Error checking socket buffer: %d\n", WSAGetLastError());
+		//	fprintf(stderr, "Error checking socket buffer: %d\n", WSAGetLastError());
 		return;
 	}
 
 	if (avail > 0) {
-	//	fprintf(stderr, "Flushing %lu bytes from socket\n", avail);
+		//	fprintf(stderr, "Flushing %lu bytes from socket\n", avail);
 
 		char temp_buf[1024];
 		while (avail > 0) {
@@ -138,7 +139,7 @@ void flush_socket(SOCKET s) {
 			avail -= read;
 		}
 
-	//	fprintf(stderr, "Socket flushed successfully\n");
+		//	fprintf(stderr, "Socket flushed successfully\n");
 	}
 }
 
@@ -149,7 +150,7 @@ int is_same_frame_header(FrameHeader* sent_header, FrameHeader* recv_header) {
 		sent_header->type, sent_header->seq_num, sent_header->length,
 		recv_header->type, recv_header->seq_num, recv_header->length);
 		*/
-	// Check if all header fields match
+		// Check if all header fields match
 	if (recv_header->type != sent_header->type ||
 		recv_header->seq_num != sent_header->seq_num ||
 		recv_header->length != sent_header->length ||
@@ -175,13 +176,30 @@ int main(int argc, char *argv[]) {
 	int seed = atoi(argv[6]);
 	int timeout_sec = atoi(argv[7]);
 
-	// Ensure frame size is valid, only constraint is it must be larger than header size
-	if (frame_size <= sizeof(FrameHeader)) {
-		fprintf(stderr, "Error: Frame size must be larger than header size (%d bytes)\n", (int)sizeof(FrameHeader));
-		return 1;
+	// Store the original frame size requested by user
+	int original_frame_size = frame_size;
+
+	// The actual frame size we'll use (ensure it's at least MIN_FRAME_SIZE)
+	int actual_frame_size = (frame_size < MIN_FRAME_SIZE) ? MIN_FRAME_SIZE : frame_size;
+
+	// Header size remains constant
+	const int header_size = sizeof(FrameHeader);
+
+	// Payload size based on user requested frame size, not the padded one
+	int payload_size = original_frame_size - header_size;
+
+	// If payload size would be negative (frame_size < header_size), set it to 0
+	if (payload_size < 0) {
+		payload_size = 0;
 	}
 
-	//fprintf(stderr, "Using frame size: %d bytes\n", frame_size);
+	// If frame size is smaller than header size, warn but continue
+	if (frame_size <= header_size) {
+		fprintf(stderr, "Warning: Frame size %d is smaller than header size (%d bytes).\n",
+			frame_size, header_size);
+		fprintf(stderr, "Using minimum frame size of %d bytes with %d bytes payload per frame.\n",
+			MIN_FRAME_SIZE, payload_size);
+	}
 
 	srand(seed);
 
@@ -194,7 +212,7 @@ int main(int argc, char *argv[]) {
 
 	FILE *fp = fopen(file_name, "rb"); //open the file 
 	if (!fp) {
-	//	perror("Error opening file");
+		//	perror("Error opening file");
 		closesocket(s);
 		WSACleanup();
 		return 1;
@@ -205,21 +223,22 @@ int main(int argc, char *argv[]) {
 	int total_file_size = ftell(fp);
 	rewind(fp);
 
-	// Calculate the number of frames to send in total
-	const int header_size = sizeof(FrameHeader);
-	const int payload_size = frame_size - header_size;
-	const int total_frames = (total_file_size + payload_size - 1) / payload_size;
+	// Calculate the number of frames based on the original payload size
+	// If payload_size is 0, we'll send one byte per frame
+	int actual_payload_size = (payload_size > 0) ? payload_size : 1;
+	const int total_frames = (total_file_size + actual_payload_size - 1) / actual_payload_size;
 
 	fprintf(stderr, "Starting transmission of %s (%d bytes in %d frames)\n",
 		file_name, total_file_size, total_frames);
-	fprintf(stderr, "Frame size: %d bytes (header: %d bytes, payload: %d bytes)\n",
-		frame_size, header_size, payload_size);
+	fprintf(stderr, "User requested frame size: %d bytes\n", original_frame_size);
+	fprintf(stderr, "Actual frame size: %d bytes (header: %d bytes, effective payload: %d bytes)\n",
+		actual_frame_size, header_size, actual_payload_size);
 
 	uint8_t my_mac[6] = { 0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01 };
 	uint8_t channel_mac[6] = { 0xFF, 0xEE, 0xDD, 0x00, 0x00, 0x00 };
 
-	// Dynamically allocate memory for frame and receive buffer based on frame_size
-	char *frame = malloc(frame_size);
+	// Dynamically allocate memory for frame and receive buffer based on actual_frame_size
+	char *frame = malloc(actual_frame_size);
 	if (!frame) {
 		fprintf(stderr, "Memory allocation failed for frame buffer\n");
 		fclose(fp);
@@ -228,7 +247,7 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	char *recv_buffer = malloc(frame_size);
+	char *recv_buffer = malloc(actual_frame_size);
 	if (!recv_buffer) {
 		fprintf(stderr, "Memory allocation failed for receive buffer\n");
 		free(frame);
@@ -248,12 +267,12 @@ int main(int argc, char *argv[]) {
 		int current_attempt = 0;
 		int success = 0;
 
-		// Calculate frame payload size (handle last frame)
-		int frame_payload_size = payload_size;
+		// Calculate actual bytes to read for this frame
+		int bytes_to_read = actual_payload_size;
 		if (frame_idx == total_frames - 1) {
-			int remaining_bytes = total_file_size - (frame_idx * payload_size);
-			if (remaining_bytes < payload_size)
-				frame_payload_size = remaining_bytes;
+			int remaining_bytes = total_file_size - (frame_idx * actual_payload_size);
+			if (remaining_bytes < actual_payload_size)
+				bytes_to_read = remaining_bytes;
 		}
 
 		// Build header for this frame
@@ -262,17 +281,28 @@ int main(int argc, char *argv[]) {
 		memcpy(header.dst_mac, channel_mac, 6);
 		header.type = FRAME_TYPE_DATA;
 		header.seq_num = frame_idx;
-		header.length = frame_payload_size;
+		header.length = bytes_to_read;  // Store the actual data length
 
 		// Copy header into frame buffer
 		memcpy(frame, &header, header_size);
 
+		// Clear the rest of the frame (for padding with zeros)
+		if (actual_frame_size > header_size) {
+			memset(frame + header_size, 0, actual_frame_size - header_size);
+		}
+
 		// Read the file data for this frame
-		fseek(fp, frame_idx * payload_size, SEEK_SET);
-		int bytes_read = fread(frame + header_size, 1, frame_payload_size, fp);
-		if (bytes_read != frame_payload_size) {
-			fprintf(stderr, "Error reading file at frame %d\n", frame_idx);
-			break;
+		fseek(fp, frame_idx * actual_payload_size, SEEK_SET);
+		int bytes_read = 0;
+
+		// Only read from file if there's actual payload to read
+		if (bytes_to_read > 0) {
+			bytes_read = fread(frame + header_size, 1, bytes_to_read, fp);
+			if (bytes_read != bytes_to_read) {
+				fprintf(stderr, "Error reading file at frame %d (read %d/%d bytes)\n",
+					frame_idx, bytes_read, bytes_to_read);
+				break;
+			}
 		}
 
 		// Transmission loop for this frame - keep trying until success or MAX_ATTEMPTS
@@ -281,22 +311,23 @@ int main(int argc, char *argv[]) {
 			total_transmissions++;
 
 			// Clear receive buffer before sending
-			memset(recv_buffer, 0, frame_size);
+			memset(recv_buffer, 0, actual_frame_size);
 
 			// Flush socket to ensure clean state before sending
 			flush_socket(s);
 
-			// Send the frame
-			int bytes_sent = send(s, frame, header_size + frame_payload_size, 0);
-			if (bytes_sent != header_size + frame_payload_size) {
-				fprintf(stderr, "Error sending frame %d (attempt %d)\n", frame_idx, current_attempt);
+			// Send the frame - always send the entire actual_frame_size
+			int bytes_sent = send(s, frame, actual_frame_size, 0);
+			if (bytes_sent != actual_frame_size) {
+				fprintf(stderr, "Error sending frame %d (attempt %d): sent %d/%d bytes\n",
+					frame_idx, current_attempt, bytes_sent, actual_frame_size);
 				continue;
 			}
 
-		//	fprintf(stderr, "Sent frame %d (attempt %d) - %d bytes\n",
-		//		frame_idx, current_attempt, header_size + frame_payload_size);
+			//	fprintf(stderr, "Sent frame %d (attempt %d) - %d bytes (payload: %d bytes)\n",
+			//		frame_idx, current_attempt, actual_frame_size, bytes_to_read);
 
-			// Set up for listening with timeout
+				// Set up for listening with timeout
 			fd_set readfds;
 			FD_ZERO(&readfds);
 			FD_SET(s, &readfds);
@@ -310,12 +341,12 @@ int main(int argc, char *argv[]) {
 
 			if (select_result > 0) {
 				// Data available to read
-				int bytes_recv = recv(s, recv_buffer, frame_size, 0);
+				int bytes_recv = recv(s, recv_buffer, actual_frame_size, 0);
 				//fprintf(stderr, "Received %d bytes back\n", bytes_recv);
 
 				if (bytes_recv < header_size) {
-				//	fprintf(stderr, "Received truncated frame or noise signal\n");
-					// Flush socket and continue to backoff logic
+					//	fprintf(stderr, "Received truncated frame or noise signal\n");
+						// Flush socket and continue to backoff logic
 					flush_socket(s);
 				}
 				else {
