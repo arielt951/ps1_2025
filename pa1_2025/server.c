@@ -5,13 +5,16 @@
 #include <string.h>
 #include <winsock2.h>
 #include <time.h>
+#include <stdbool.h>
+#include <conio.h>  // For _kbhit() and _getch() functions
 
 #pragma comment(lib, "Ws2_32.lib")
 
 #define MAX_ATTEMPTS 10
 #define FRAME_TYPE_DATA 0
 #define FRAME_TYPE_NOISE 2
-#define MAX_FRAME_SIZE 1600 // Maximum safe frame size
+#define CONNECTION_RETRY_MS 1000  // Time between connection retry attempts
+#define MAX_CTRL_Z_WAIT_SEC 60     // Maximum time to wait for Ctrl+Z input in seconds
 
 #pragma pack(push, 1)
 typedef struct {
@@ -21,8 +24,91 @@ typedef struct {
 	uint32_t seq_num;
 	uint16_t length;
 } FrameHeader;
-//20bytes header size
 #pragma pack(pop)
+
+// Function prototypes
+bool check_for_exit(void);
+SOCKET connect_to_channel(const char *chan_ip, int chan_port, int timeout_sec);
+void flush_socket(SOCKET s);
+int is_same_frame_header(FrameHeader* sent_header, FrameHeader* recv_header);
+
+// Function to check for Ctrl+Z input from user
+bool check_for_exit(void) {
+	if (_kbhit()) {
+		int c = _getch();
+		// Check for Control+Z (ASCII 26) or Control+C (ASCII 3)
+		if (c == 26 || c == 3) {
+			//fprintf(stderr, "\nExit command detected (Ctrl+Z or Ctrl+C). Exiting...\n");
+			return true;
+		}
+	}
+	return false;
+}
+
+// Function to connect to channel with retry mechanism
+SOCKET connect_to_channel(const char *chan_ip, int chan_port, int timeout_sec) {
+	WSADATA wsaData;
+	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (iResult != 0) {
+		fprintf(stderr, "Error at WSAStartup()\n");
+		return INVALID_SOCKET;
+	}
+
+	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s == INVALID_SOCKET) {
+		fprintf(stderr, "Error at socket(): %ld\n", WSAGetLastError());
+		WSACleanup();
+		return INVALID_SOCKET;
+	}
+
+	struct sockaddr_in server_addr;
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = htons(chan_port);
+	server_addr.sin_addr.s_addr = inet_addr(chan_ip);
+
+	// Keep trying to connect until timeout
+	//fprintf(stderr, "Attempting to connect to channel at %s:%d\n", chan_ip, chan_port);
+	//fprintf(stderr, "Press Ctrl+Z to cancel and exit...\n");
+
+	clock_t start_time = clock();
+	clock_t current_time;
+	bool connected = false;
+
+	do {
+		// Check if user wants to exit
+		if (check_for_exit()) {
+			closesocket(s);
+			WSACleanup();
+			exit(0); // Exit the program if user presses Ctrl+Z
+		}
+
+		if (connect(s, (struct sockaddr *)&server_addr, sizeof(server_addr)) == 0) {
+			connected = true;
+			fprintf(stderr, "Successfully connected to channel\n");
+			break;
+		}
+
+		int error = WSAGetLastError();
+		if (error != WSAECONNREFUSED && error != WSAENETUNREACH && error != WSAETIMEDOUT) {
+			fprintf(stderr, "Connection error: %d\n", error);
+			break;
+		}
+
+		fprintf(stderr, "Channel not available yet, retrying in %d ms...\n", CONNECTION_RETRY_MS);
+		Sleep(CONNECTION_RETRY_MS);
+
+		current_time = clock();
+	} while (((current_time - start_time) / CLOCKS_PER_SEC) < timeout_sec);
+
+	if (!connected) {
+		fprintf(stderr, "Connection attempts timed out after %d seconds\n", timeout_sec);
+		closesocket(s);
+		WSACleanup();
+		return INVALID_SOCKET;
+	}
+
+	return s;
+}
 
 // Function to flush all pending data from a socket
 void flush_socket(SOCKET s) {
@@ -30,12 +116,12 @@ void flush_socket(SOCKET s) {
 
 	// Check how many bytes are available to read
 	if (ioctlsocket(s, FIONREAD, &avail) != 0) {
-		fprintf(stderr, "Error checking socket buffer: %d\n", WSAGetLastError());
+	//	fprintf(stderr, "Error checking socket buffer: %d\n", WSAGetLastError());
 		return;
 	}
 
 	if (avail > 0) {
-		fprintf(stderr, "Flushing %lu bytes from socket\n", avail);
+	//	fprintf(stderr, "Flushing %lu bytes from socket\n", avail);
 
 		char temp_buf[1024];
 		while (avail > 0) {
@@ -52,48 +138,17 @@ void flush_socket(SOCKET s) {
 			avail -= read;
 		}
 
-		fprintf(stderr, "Socket flushed successfully\n");
+	//	fprintf(stderr, "Socket flushed successfully\n");
 	}
-}
-
-//function to open and connect to socket
-SOCKET connect_to_channel(const char *chan_ip, int chan_port) {
-	WSADATA wsaData; //start 
-	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-	if (iResult != 0) {
-		fprintf(stderr, "Error at WSAStartup()\n");
-		return INVALID_SOCKET;
-	}
-
-	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); //create socket
-	if (s == INVALID_SOCKET) {
-		fprintf(stderr, "Error at socket(): %ld\n", WSAGetLastError());
-		WSACleanup();
-		return INVALID_SOCKET;
-	}
-
-	struct sockaddr_in server_addr; //configure addr
-	server_addr.sin_family = AF_INET;
-	server_addr.sin_port = htons(chan_port);
-	server_addr.sin_addr.s_addr = inet_addr(chan_ip);
-
-	if (connect(s, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) { //connect
-		fprintf(stderr, "Connection to channel failed\n");
-		closesocket(s);
-		WSACleanup();
-		return INVALID_SOCKET;
-	}
-
-	return s;
 }
 
 // Function to verify if received frame header matches sent frame header
 int is_same_frame_header(FrameHeader* sent_header, FrameHeader* recv_header) {
 	// Debug print to see what headers we're comparing
-	fprintf(stderr, "Comparing headers - Sent: type=%d, seq=%u, len=%d vs Received: type=%d, seq=%u, len=%d\n",
+	/*fprintf(stderr, "Comparing headers - Sent: type=%d, seq=%u, len=%d vs Received: type=%d, seq=%u, len=%d\n",
 		sent_header->type, sent_header->seq_num, sent_header->length,
 		recv_header->type, recv_header->seq_num, recv_header->length);
-
+		*/
 	// Check if all header fields match
 	if (recv_header->type != sent_header->type ||
 		recv_header->seq_num != sent_header->seq_num ||
@@ -110,7 +165,8 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "Usage: %s <chan_ip> <chan_port> <file_name> <frame_size> <slot_time> <seed> <timeout>\n", argv[0]);
 		return 1;
 	}
-	//Parse arguments 
+
+	// Parse arguments 
 	const char *chan_ip = argv[1];
 	int chan_port = atoi(argv[2]);
 	const char *file_name = argv[3];
@@ -119,21 +175,18 @@ int main(int argc, char *argv[]) {
 	int seed = atoi(argv[6]);
 	int timeout_sec = atoi(argv[7]);
 
-	// Ensure frame size is valid
+	// Ensure frame size is valid, only constraint is it must be larger than header size
 	if (frame_size <= sizeof(FrameHeader)) {
 		fprintf(stderr, "Error: Frame size must be larger than header size (%d bytes)\n", (int)sizeof(FrameHeader));
 		return 1;
 	}
 
-	if (frame_size > MAX_FRAME_SIZE) {
-		fprintf(stderr, "Warning: Frame size %d exceeds maximum recommended size of %d bytes. Limiting.\n",
-			frame_size, MAX_FRAME_SIZE);
-		frame_size = MAX_FRAME_SIZE;
-	}
+	//fprintf(stderr, "Using frame size: %d bytes\n", frame_size);
 
 	srand(seed);
 
-	SOCKET s = connect_to_channel(chan_ip, chan_port);
+	// Connect to the channel with retry mechanism
+	SOCKET s = connect_to_channel(chan_ip, chan_port, timeout_sec);
 	if (s == INVALID_SOCKET) {
 		fprintf(stderr, "Error: Failed to connect to channel at %s:%d\n", chan_ip, chan_port);
 		return 1;
@@ -141,17 +194,18 @@ int main(int argc, char *argv[]) {
 
 	FILE *fp = fopen(file_name, "rb"); //open the file 
 	if (!fp) {
-		perror("Error opening file");
+	//	perror("Error opening file");
 		closesocket(s);
 		WSACleanup();
 		return 1;
 	}
-	//retrieve file size 
+
+	// Retrieve file size 
 	fseek(fp, 0, SEEK_END);
 	int total_file_size = ftell(fp);
 	rewind(fp);
 
-	//calculating the # of frames to send in total
+	// Calculate the number of frames to send in total
 	const int header_size = sizeof(FrameHeader);
 	const int payload_size = frame_size - header_size;
 	const int total_frames = (total_file_size + payload_size - 1) / payload_size;
@@ -164,17 +218,26 @@ int main(int argc, char *argv[]) {
 	uint8_t my_mac[6] = { 0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01 };
 	uint8_t channel_mac[6] = { 0xFF, 0xEE, 0xDD, 0x00, 0x00, 0x00 };
 
-	//allocating memory for each frame 
+	// Dynamically allocate memory for frame and receive buffer based on frame_size
 	char *frame = malloc(frame_size);
 	if (!frame) {
-		fprintf(stderr, "Memory allocation failed\n");
+		fprintf(stderr, "Memory allocation failed for frame buffer\n");
 		fclose(fp);
 		closesocket(s);
 		WSACleanup();
 		return 1;
 	}
 
-	char recv_buffer[MAX_FRAME_SIZE];  // Buffer for receiving frames
+	char *recv_buffer = malloc(frame_size);
+	if (!recv_buffer) {
+		fprintf(stderr, "Memory allocation failed for receive buffer\n");
+		free(frame);
+		fclose(fp);
+		closesocket(s);
+		WSACleanup();
+		return 1;
+	}
+
 	int total_transmissions = 0;
 	int max_transmissions = 0;
 	int successful_frames = 0;
@@ -218,7 +281,7 @@ int main(int argc, char *argv[]) {
 			total_transmissions++;
 
 			// Clear receive buffer before sending
-			memset(recv_buffer, 0, sizeof(recv_buffer));
+			memset(recv_buffer, 0, frame_size);
 
 			// Flush socket to ensure clean state before sending
 			flush_socket(s);
@@ -230,8 +293,8 @@ int main(int argc, char *argv[]) {
 				continue;
 			}
 
-			fprintf(stderr, "Sent frame %d (attempt %d) - %d bytes\n",
-				frame_idx, current_attempt, header_size + frame_payload_size);
+		//	fprintf(stderr, "Sent frame %d (attempt %d) - %d bytes\n",
+		//		frame_idx, current_attempt, header_size + frame_payload_size);
 
 			// Set up for listening with timeout
 			fd_set readfds;
@@ -247,11 +310,11 @@ int main(int argc, char *argv[]) {
 
 			if (select_result > 0) {
 				// Data available to read
-				int bytes_recv = recv(s, recv_buffer, sizeof(recv_buffer), 0);
-				fprintf(stderr, "Received %d bytes back\n", bytes_recv);
+				int bytes_recv = recv(s, recv_buffer, frame_size, 0);
+				//fprintf(stderr, "Received %d bytes back\n", bytes_recv);
 
 				if (bytes_recv < header_size) {
-					fprintf(stderr, "Received truncated frame or noise signal\n");
+				//	fprintf(stderr, "Received truncated frame or noise signal\n");
 					// Flush socket and continue to backoff logic
 					flush_socket(s);
 				}
@@ -267,13 +330,13 @@ int main(int argc, char *argv[]) {
 						// SUCCESS - Header matches between sent and received frame
 						success = 1;
 						successful_frames++;
-						fprintf(stderr, "Frame %d transmitted successfully\n", frame_idx);
+						//fprintf(stderr, "Frame %d transmitted successfully\n", frame_idx);
 						break;  // Exit retry loop
 					}
 					else {
 						// Received a frame but the header doesn't match ours
-						fprintf(stderr, "Received mismatched frame, type=%d, seq=%u\n",
-							response->type, response->seq_num);
+					//	fprintf(stderr, "Received mismatched frame, type=%d, seq=%u\n",
+					//		response->type, response->seq_num);
 						// Flush socket and continue to backoff logic
 						flush_socket(s);
 					}
@@ -331,6 +394,7 @@ int main(int argc, char *argv[]) {
 		(8.0 * total_file_size) / (duration_ms / 1000.0) / 1000000.0 : 0;
 
 	// Print results to stderr as required
+	fprintf(stderr, "\n");
 	fprintf(stderr, "Sent file %s\n", file_name);
 	fprintf(stderr, "Result: %s\n", (successful_frames == total_frames) ? "Success :)" : "Failure :(");
 	fprintf(stderr, "File size: %d Bytes (%d frames)\n", total_file_size, total_frames);
@@ -340,6 +404,7 @@ int main(int argc, char *argv[]) {
 
 	// Clean up
 	free(frame);
+	free(recv_buffer);
 	fclose(fp);
 	closesocket(s);
 	WSACleanup();
