@@ -125,10 +125,10 @@ void ensure_buffer_capacity(ClientNode* client, int required_size) {
 		if (new_buffer) {
 			client->info.buffer = new_buffer;
 			client->info.buffer_size = required_size;
-			//		fprintf(stderr, "Resized buffer for client %s:%d to %d bytes\n",
-				//		inet_ntoa(client->info.addr.sin_addr),
-				//		ntohs(client->info.addr.sin_port),
-					//	required_size);
+					fprintf(stderr, "Resized buffer for client %s:%d to %d bytes\n",
+						inet_ntoa(client->info.addr.sin_addr),
+						ntohs(client->info.addr.sin_port),
+						required_size);
 		}
 		else {
 			//		fprintf(stderr, "Failed to resize buffer for client %s:%d\n",

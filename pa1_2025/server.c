@@ -420,9 +420,10 @@ int main(int argc, char *argv[]) {
 	// Calculate statistics
 	clock_t end_time = clock();
 	int duration_ms = (int)((end_time - start_time) * 1000.0 / CLOCKS_PER_SEC);
-	double avg_transmissions = (double)total_transmissions / (successful_frames > 0 ? successful_frames : 1);
 	double avg_bandwidth_mbps = successful_frames > 0 ?
-		(8.0 * total_file_size) / (duration_ms / 1000.0) / 1000000.0 : 0;
+		(8.0 * successful_frames * actual_frame_size) / (duration_ms / 1000.0) / 1000000.0 : 0;
+	double avg_transmissions = (double)total_transmissions / (successful_frames > 0 ? successful_frames : 1);
+	
 
 	// Print results to stderr as required
 	fprintf(stderr, "\n");
