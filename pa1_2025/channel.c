@@ -30,8 +30,9 @@ typedef struct {
 typedef struct {
 	SOCKET socket;
 	struct sockaddr_in addr;
-	int total_frames;
-	int collision_count;
+	int total_frames_received;   // All frames received from this client
+	int successful_frames;       // Frames successfully transmitted (no collision)
+	int collision_count;         // Number of times this client was involved in a collision
 	clock_t first_frame_time;
 	clock_t last_frame_time;
 	int64_t total_bytes;
@@ -62,7 +63,7 @@ void cleanup_clients(void);
 char* create_noise_frame(void);
 void broadcast_noise_frame(char* noise_buffer);
 bool check_for_exit(void);
-void broadcast_to_all(char* buffer, int length);
+void broadcast_to_all(char* buffer, int length, ClientNode* sender);
 double calculate_bandwidth(int64_t bytes, clock_t start_time, clock_t end_time);
 void print_all_statistics(void);
 
@@ -124,15 +125,15 @@ void ensure_buffer_capacity(ClientNode* client, int required_size) {
 		if (new_buffer) {
 			client->info.buffer = new_buffer;
 			client->info.buffer_size = required_size;
-	//		fprintf(stderr, "Resized buffer for client %s:%d to %d bytes\n",
-		//		inet_ntoa(client->info.addr.sin_addr),
-		//		ntohs(client->info.addr.sin_port),
-			//	required_size);
+			//		fprintf(stderr, "Resized buffer for client %s:%d to %d bytes\n",
+				//		inet_ntoa(client->info.addr.sin_addr),
+				//		ntohs(client->info.addr.sin_port),
+					//	required_size);
 		}
 		else {
-	//		fprintf(stderr, "Failed to resize buffer for client %s:%d\n",
-	//			inet_ntoa(client->info.addr.sin_addr),
-	//			ntohs(client->info.addr.sin_port));
+			//		fprintf(stderr, "Failed to resize buffer for client %s:%d\n",
+			//			inet_ntoa(client->info.addr.sin_addr),
+			//			ntohs(client->info.addr.sin_port));
 		}
 	}
 }
@@ -143,11 +144,11 @@ void mark_client_disconnected(ClientNode* client) {
 		client->info.active = false;
 		client->info.connected = false;
 
-	//	fprintf(stderr, "Server %s:%d disconnected (stats will be kept until exit)\n",
-	//		inet_ntoa(client->info.addr.sin_addr),
-	//		ntohs(client->info.addr.sin_port));
+		//	fprintf(stderr, "Server %s:%d disconnected (stats will be kept until exit)\n",
+		//		inet_ntoa(client->info.addr.sin_addr),
+		//		ntohs(client->info.addr.sin_port));
 
-		// Close the socket but keep the client node in the list
+			// Close the socket but keep the client node in the list
 		closesocket(client->info.socket);
 	}
 }
@@ -172,7 +173,8 @@ ClientNode* add_client(SOCKET socket, struct sockaddr_in addr) {
 	// Initialize client info
 	new_client->info.socket = socket;
 	new_client->info.addr = addr;
-	new_client->info.total_frames = 0;
+	new_client->info.total_frames_received = 0;
+	new_client->info.successful_frames = 0;
 	new_client->info.collision_count = 0;
 	new_client->info.first_frame_time = 0;
 	new_client->info.last_frame_time = 0;
@@ -248,8 +250,8 @@ char* create_noise_frame(void) {
 	noise->seq_num = 0xFFFFFFFF;  // Special value
 	noise->length = sizeof(FrameHeader);
 
-//	fprintf(stderr, "Created noise frame with Type: %d, Seq: %u, Length: %d\n",
-//		noise->type, noise->seq_num, noise->length);
+	//	fprintf(stderr, "Created noise frame with Type: %d, Seq: %u, Length: %d\n",
+	//		noise->type, noise->seq_num, noise->length);
 
 	return noise_buffer;
 }
@@ -289,22 +291,22 @@ void broadcast_noise_frame(char* noise_buffer) {
 			}
 			else if (sent == sizeof(FrameHeader)) {
 				successful_sends++;
-	//			fprintf(stderr, "  Sent noise frame to %s:%d\n",
-				//	inet_ntoa(current->info.addr.sin_addr),
-				//	ntohs(current->info.addr.sin_port));
+				//			fprintf(stderr, "  Sent noise frame to %s:%d\n",
+							//	inet_ntoa(current->info.addr.sin_addr),
+							//	ntohs(current->info.addr.sin_port));
 			}
 			else {
-	//			fprintf(stderr, "  Partial send to %s:%d: %d of %d bytes\n",
-				//	inet_ntoa(current->info.addr.sin_addr),
-				//	ntohs(current->info.addr.sin_port),
-				//	sent, (int)sizeof(FrameHeader));
+				//			fprintf(stderr, "  Partial send to %s:%d: %d of %d bytes\n",
+							//	inet_ntoa(current->info.addr.sin_addr),
+							//	ntohs(current->info.addr.sin_port),
+							//	sent, (int)sizeof(FrameHeader));
 			}
 		}
 		current = current->next;
 	}
 
-//	fprintf(stderr, "Noise frame broadcast complete: %d successful, %d failed\n",
-	//	successful_sends, failed_sends);
+	//	fprintf(stderr, "Noise frame broadcast complete: %d successful, %d failed\n",
+		//	successful_sends, failed_sends);
 }
 
 // Function to check for user input (Ctrl+Z)
@@ -322,7 +324,8 @@ bool check_for_exit(void) {
 }
 
 // Broadcast a message to all connected clients
-void broadcast_to_all(char* buffer, int length) {
+// Now includes the sender parameter to track successful transmissions
+void broadcast_to_all(char* buffer, int length, ClientNode* sender) {
 	ClientNode* current = client_list;
 	int successful_sends = 0;
 
@@ -332,7 +335,7 @@ void broadcast_to_all(char* buffer, int length) {
 			if (sent == SOCKET_ERROR) {
 				int err = WSAGetLastError();
 				if (err != WSAEWOULDBLOCK) {
-		//			fprintf(stderr, "Error sending to client: %d\n", err);
+					//			fprintf(stderr, "Error sending to client: %d\n", err);
 					current->info.active = false;
 				}
 			}
@@ -341,6 +344,12 @@ void broadcast_to_all(char* buffer, int length) {
 			}
 		}
 		current = current->next;
+	}
+
+	// If all sends were successful and we know who sent this frame, 
+	// increment their successful frames counter
+	if (successful_sends > 0 && sender != NULL) {
+		sender->info.successful_frames++;
 	}
 
 	//fprintf(stderr, "Broadcast frame to %d active clients\n", successful_sends);
@@ -363,12 +372,12 @@ double calculate_bandwidth(int64_t bytes, clock_t start_time, clock_t end_time) 
 
 // Function to print all statistics
 void print_all_statistics(void) {
-//	fprintf(stderr, "\n=== Channel Statistics ===\n");
+	//	fprintf(stderr, "\n=== Channel Statistics ===\n");
 
-	// Print statistics for all clients (connected and disconnected)
+		// Print statistics for all clients (connected and disconnected)
 	ClientNode* current = client_list;
 	while (current != NULL) {
-		if (current->info.total_frames > 0) {  // Only report clients that sent frames
+		if (current->info.total_frames_received > 0) {  // Only report clients that sent frames
 			// Calculate bandwidth
 			double bandwidth_mbps = calculate_bandwidth(
 				current->info.total_bytes,
@@ -379,7 +388,7 @@ void print_all_statistics(void) {
 			fprintf(stderr, "From %s port %d: %d frames, %d collisions\n",
 				inet_ntoa(current->info.addr.sin_addr),
 				ntohs(current->info.addr.sin_port),
-				current->info.total_frames,
+				current->info.successful_frames,  // Changed to show successful frames instead of total
 				current->info.collision_count);
 
 			fprintf(stderr, "Average bandwidth: %.3f Mbps\n", bandwidth_mbps);
@@ -408,7 +417,7 @@ int main(int argc, char *argv[]) {
 	// Create the noise frame once at startup
 	char* noise_buffer = create_noise_frame();
 	if (!noise_buffer) {
-	//	fprintf(stderr, "Failed to create noise frame, exiting\n");
+		//	fprintf(stderr, "Failed to create noise frame, exiting\n");
 		closesocket(tcp_s);
 		WSACleanup();
 		return 1;
@@ -526,7 +535,8 @@ int main(int argc, char *argv[]) {
 					}
 
 					// Update statistics
-					current->info.total_frames++;
+					current->info.total_frames_received++;  // Count all frames received
+
 					if (current->info.first_frame_time == 0) {
 						current->info.first_frame_time = clock();
 					}
@@ -535,19 +545,19 @@ int main(int argc, char *argv[]) {
 
 					// Print received message information
 					FrameHeader* header = (FrameHeader*)current->info.buffer;
-		/*			printf("Received frame from %s:%d - Type: %d, Seq: %u, Length: %d bytes\n",
-						inet_ntoa(current->info.addr.sin_addr),
-						ntohs(current->info.addr.sin_port),
-						header->type,
-						header->seq_num,
-						bytes);*/
+					/*			printf("Received frame from %s:%d - Type: %d, Seq: %u, Length: %d bytes\n",
+									inet_ntoa(current->info.addr.sin_addr),
+									ntohs(current->info.addr.sin_port),
+									header->type,
+									header->seq_num,
+									bytes);*/
 				}
 				else if (bytes == 0 || (bytes == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK)) {
 					// Client disconnected or error
 					printf("Client disconnected: %s:%d\n",
 						inet_ntoa(current->info.addr.sin_addr),
 						ntohs(current->info.addr.sin_port));
-						
+
 					// Mark as disconnected but keep in list
 					mark_client_disconnected(current);
 				}
@@ -559,13 +569,14 @@ int main(int argc, char *argv[]) {
 		// Process received frames
 		if (frames_received == 1) {
 			// No collision - broadcast the frame to all clients
+			// We now pass the sender so we can track successful frames
 			FrameHeader* header = (FrameHeader*)received_frames[0].buffer;
-	/*		printf("Broadcasting frame - Type: %d, Seq: %u, Length: %d bytes\n",
-				header->type,
-				header->seq_num,
-				received_frames[0].length);
-				*/
-			broadcast_to_all(received_frames[0].buffer, received_frames[0].length);
+			/*		printf("Broadcasting frame - Type: %d, Seq: %u, Length: %d bytes\n",
+						header->type,
+						header->seq_num,
+						received_frames[0].length);
+						*/
+			broadcast_to_all(received_frames[0].buffer, received_frames[0].length, received_frames[0].sender);
 		}
 		else if (frames_received > 1) {
 			// Collision detected
@@ -578,10 +589,10 @@ int main(int argc, char *argv[]) {
 			for (int k = 0; k < frames_received; k++) {
 				if (received_frames[k].sender) {
 					received_frames[k].sender->info.collision_count++;
-		/*			printf("Incremented collision count for %s:%d to %d\n",
-						inet_ntoa(received_frames[k].sender->info.addr.sin_addr),
-						ntohs(received_frames[k].sender->info.addr.sin_port),
-						received_frames[k].sender->info.collision_count);*/
+					/*			printf("Incremented collision count for %s:%d to %d\n",
+									inet_ntoa(received_frames[k].sender->info.addr.sin_addr),
+									ntohs(received_frames[k].sender->info.addr.sin_port),
+									received_frames[k].sender->info.collision_count);*/
 				}
 			}
 		}
